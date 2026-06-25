@@ -382,7 +382,7 @@ st.markdown("")
 
 
 # ── Onglets ───────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 Graphiques", "🚨 Alertes détaillées", "🏭 Bénéficiaires", "📝 Rapport complet", "📋 Toutes les transactions"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📈 Graphiques", "🚨 Alertes détaillées", "📅 Comparaison mensuelle", "🏭 Bénéficiaires", "📝 Rapport complet", "📋 Toutes les transactions"])
 
 
 # ── TAB 1 — Graphiques ────────────────────────────────────────────────────────
@@ -518,8 +518,148 @@ with tab2:
                 st.dataframe(display, use_container_width=True, hide_index=True)
 
 
-# ── TAB 3 — Bénéficiaires ────────────────────────────────────────────────────
+# ── TAB 3 — Comparaison mensuelle ─────────────────────────────────────────────
 with tab3:
+    st.markdown("### Comparaison mois par mois")
+
+    if monthly.empty or len(monthly) < 2:
+        st.info("Il faut au moins 2 mois de données pour comparer.")
+    else:
+        # ── Tableau récapitulatif mensuel ──────────────────────────────────────
+        monthly_display = monthly.copy()
+        monthly_display['Mois'] = monthly_display['month'].dt.strftime('%B %Y')
+
+        # Calcul des variations vs mois précédent
+        monthly_display['var_in']  = monthly_display['total_in'].pct_change() * 100
+        monthly_display['var_out'] = monthly_display['total_out'].pct_change() * 100
+        monthly_display['var_net'] = monthly_display['net'].diff()
+
+        # Alertes par mois
+        if not flags_df.empty and 'date' in flags_df.columns:
+            flags_df['month_period'] = pd.to_datetime(flags_df['date']).dt.to_period('M')
+            alerts_by_month = flags_df.groupby('month_period').size().reset_index()
+            alerts_by_month.columns = ['month_period', 'alertes']
+            monthly_display['month_period'] = monthly_display['month'].dt.to_period('M')
+            monthly_display = monthly_display.merge(alerts_by_month, on='month_period', how='left')
+            monthly_display['alertes'] = monthly_display['alertes'].fillna(0).astype(int)
+        else:
+            monthly_display['alertes'] = 0
+
+        # ── Graphique comparaison entrées vs sorties ───────────────────────────
+        fig_comp = go.Figure()
+        fig_comp.add_trace(go.Bar(
+            x=monthly_display['Mois'], y=monthly_display['total_in'],
+            name='Entrées (€)', marker_color='#00d4aa', opacity=0.85
+        ))
+        fig_comp.add_trace(go.Bar(
+            x=monthly_display['Mois'], y=monthly_display['total_out'],
+            name='Sorties (€)', marker_color='#e94560', opacity=0.85
+        ))
+        fig_comp.add_trace(go.Scatter(
+            x=monthly_display['Mois'], y=monthly_display['net'],
+            name='Net (€)', mode='lines+markers+text',
+            line=dict(color='#ffd700', width=3),
+            marker=dict(size=8),
+            text=[f"{v:+,.0f}€" for v in monthly_display['net']],
+            textposition='top center',
+            textfont=dict(color='#ffd700', size=11),
+        ))
+        fig_comp.update_layout(
+            title='Entrées vs Sorties par mois',
+            barmode='group',
+            paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+            font_color='#a8b2d8', height=400,
+            legend=dict(orientation='h', y=1.1)
+        )
+        st.plotly_chart(fig_comp, use_container_width=True)
+
+        # ── Graphique évolution des alertes ───────────────────────────────────
+        if monthly_display['alertes'].sum() > 0:
+            fig_alerts = go.Figure()
+            bar_colors = ['#e94560' if a > 5 else ('#ff6b35' if a > 2 else '#ffd700')
+                          for a in monthly_display['alertes']]
+            fig_alerts.add_trace(go.Bar(
+                x=monthly_display['Mois'], y=monthly_display['alertes'],
+                name='Alertes', marker_color=bar_colors,
+                text=monthly_display['alertes'],
+                textposition='outside',
+            ))
+            fig_alerts.update_layout(
+                title='Nombre d\'alertes de fraude par mois',
+                paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+                font_color='#a8b2d8', height=320, showlegend=False,
+            )
+            st.plotly_chart(fig_alerts, use_container_width=True)
+
+        # ── Tableau détaillé mois par mois ────────────────────────────────────
+        st.markdown("#### Tableau détaillé — variation vs mois précédent")
+
+        rows_html = ""
+        for _, row_m in monthly_display.iterrows():
+            var_in_str  = f"+{row_m['var_in']:.1f}%" if row_m['var_in'] > 0 else f"{row_m['var_in']:.1f}%" if not pd.isna(row_m['var_in']) else "—"
+            var_out_str = f"+{row_m['var_out']:.1f}%" if row_m['var_out'] > 0 else f"{row_m['var_out']:.1f}%" if not pd.isna(row_m['var_out']) else "—"
+            var_in_color  = "#00d4aa" if (not pd.isna(row_m['var_in'])  and row_m['var_in']  > 0) else ("#e94560" if (not pd.isna(row_m['var_in'])  and row_m['var_in']  < 0) else "#a8b2d8")
+            var_out_color = "#e94560" if (not pd.isna(row_m['var_out']) and row_m['var_out'] > 20) else "#a8b2d8"
+            net_color = "#00d4aa" if row_m['net'] >= 0 else "#e94560"
+            alert_badge = f"<span style='background:#e94560;color:white;border-radius:4px;padding:1px 6px;font-size:0.8rem'>⚠️ {row_m['alertes']}</span>" if row_m['alertes'] > 0 else "<span style='color:#00d4aa'>✅ 0</span>"
+            rows_html += f"""
+            <tr>
+                <td style='padding:8px 12px;font-weight:600'>{row_m['Mois']}</td>
+                <td style='padding:8px 12px;color:#00d4aa'>{row_m['total_in']:,.0f}€</td>
+                <td style='padding:8px 12px;color:{var_in_color}'>{var_in_str}</td>
+                <td style='padding:8px 12px;color:#e94560'>{row_m['total_out']:,.0f}€</td>
+                <td style='padding:8px 12px;color:{var_out_color}'>{var_out_str}</td>
+                <td style='padding:8px 12px;color:{net_color};font-weight:700'>{row_m['net']:+,.0f}€</td>
+                <td style='padding:8px 12px;text-align:center'>{alert_badge}</td>
+            </tr>"""
+
+        st.markdown(f"""
+        <table style='width:100%;border-collapse:collapse;background:#13172a;border-radius:10px;overflow:hidden'>
+            <thead>
+                <tr style='background:#1e2640;color:#a8b2d8;font-size:0.85rem'>
+                    <th style='padding:10px 12px;text-align:left'>Mois</th>
+                    <th style='padding:10px 12px;text-align:left'>Entrées</th>
+                    <th style='padding:10px 12px;text-align:left'>Var. entrées</th>
+                    <th style='padding:10px 12px;text-align:left'>Sorties</th>
+                    <th style='padding:10px 12px;text-align:left'>Var. sorties</th>
+                    <th style='padding:10px 12px;text-align:left'>Net</th>
+                    <th style='padding:10px 12px;text-align:center'>Alertes</th>
+                </tr>
+            </thead>
+            <tbody style='color:#e2e8f0;font-size:0.9rem'>
+                {rows_html}
+            </tbody>
+        </table>
+        """, unsafe_allow_html=True)
+
+        # ── Analyse automatique des anomalies mensuelles ───────────────────────
+        st.markdown("")
+        st.markdown("#### Ce que la comparaison révèle")
+
+        insights = []
+        for i, row_m in monthly_display.iterrows():
+            if pd.isna(row_m['var_out']):
+                continue
+            if row_m['var_out'] > 50:
+                insights.append(f"🔴 **{row_m['Mois']}** — sorties en hausse de **+{row_m['var_out']:.0f}%** vs le mois précédent. Justification requise.")
+            elif row_m['var_out'] > 25:
+                insights.append(f"🟠 **{row_m['Mois']}** — sorties en hausse de +{row_m['var_out']:.0f}% vs le mois précédent.")
+            if not pd.isna(row_m['var_in']) and row_m['var_in'] < -30:
+                insights.append(f"🟠 **{row_m['Mois']}** — entrées en baisse de {row_m['var_in']:.0f}% — possible dissimulation de recettes.")
+            if row_m['alertes'] >= 5:
+                insights.append(f"🚨 **{row_m['Mois']}** — mois avec le plus d'alertes : **{row_m['alertes']} signaux** détectés.")
+
+        worst_month = monthly_display.loc[monthly_display['total_out'].idxmax(), 'Mois']
+        best_month  = monthly_display.loc[monthly_display['net'].idxmax(), 'Mois']
+        insights.append(f"📊 Mois avec les dépenses les plus élevées : **{worst_month}**")
+        insights.append(f"💰 Mois avec le meilleur résultat net : **{best_month}**")
+
+        for insight in insights:
+            st.markdown(f"- {insight}")
+
+
+# ── TAB 4 — Bénéficiaires ────────────────────────────────────────────────────
+with tab4:
     st.markdown("### Analyse par bénéficiaire / poste de dépense")
     debits_b = df[df['amount'] < 0].copy()
     if debits_b.empty:
@@ -563,13 +703,13 @@ with tab3:
         st.plotly_chart(fig_donut, use_container_width=True)
 
 
-# ── TAB 4 — Rapport narratif ──────────────────────────────────────────────────
-with tab4:
+# ── TAB 5 — Rapport narratif ──────────────────────────────────────────────────
+with tab5:
     st.markdown(report_text)
 
 
-# ── TAB 5 — Transactions ─────────────────────────────────────────────────────
-with tab5:
+# ── TAB 6 — Transactions ─────────────────────────────────────────────────────
+with tab6:
     st.markdown(f"### {len(df):,} transactions extraites")
 
     c1, c2, c3 = st.columns(3)
