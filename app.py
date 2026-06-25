@@ -291,18 +291,9 @@ with st.spinner("Analyse en cours — 27 modules de détection..."):
         flags_df = run_engine(df)
 
     if opt_stats:
-        extra = []
-        for key in ['zscore_flags', 'iqr_flags', 'temporal_flags']:
-            f = stats_results.get(key, pd.DataFrame())
-            if not f.empty:
-                if 'categorie' not in f.columns:
-                    f['categorie'] = 'anomalie_statistique'
-                if 'score_contribution' not in f.columns:
-                    f['score_contribution'] = 50
-                extra.append(f)
-        if extra:
-            extra_df = pd.concat(extra, ignore_index=True)
-            flags_df = pd.concat([flags_df, extra_df], ignore_index=True) if not flags_df.empty else extra_df
+        mad_flags = stats_results.get('mad_flags', pd.DataFrame())
+        if not mad_flags.empty:
+            flags_df = pd.concat([flags_df, mad_flags], ignore_index=True) if not flags_df.empty else mad_flags
 
     if not flags_df.empty and 'transaction_id' in flags_df.columns:
         flags_df = flags_df.drop_duplicates(subset=['transaction_id', 'rule'])
