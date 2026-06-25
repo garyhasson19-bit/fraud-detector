@@ -29,10 +29,11 @@ def build_executive_summary(df, flags_df, stats, risk_score, business_type):
     total_c = stats.get('total_credit_amount', 0)
     avg_d   = stats.get('avg_debit', 0)
 
-    # Montant total impliqué dans les alertes
+    # Montant total impliqué dans les alertes — par transaction unique
     amount_at_risk = 0
-    if not flags_df.empty and 'amount' in flags_df.columns:
-        amount_at_risk = flags_df['amount'].abs().sum()
+    if not flags_df.empty and 'transaction_id' in flags_df.columns:
+        unique_flagged = flags_df.drop_duplicates(subset=['transaction_id'])
+        amount_at_risk = unique_flagged['amount'].abs().sum()
 
     # Point 1 — flux global
     if net < 0:
@@ -365,9 +366,14 @@ with sum_col2:
         st.markdown(f'<div class="amount-ok">✅ Montant à risque<br>0 €</div>', unsafe_allow_html=True)
     st.markdown("")
     total_txns = stats.get('total_transactions', 0)
-    pct_flagged = len(flags_df) / total_txns * 100 if total_txns > 0 and not flags_df.empty else 0
+    # Compte les transactions UNIQUES signalées (pas le nombre total d'alertes)
+    n_txns_flagged = flags_df['transaction_id'].nunique() if not flags_df.empty and 'transaction_id' in flags_df.columns else 0
+    pct_flagged = n_txns_flagged / total_txns * 100 if total_txns > 0 else 0
+    pct_flagged = min(pct_flagged, 100)  # Ne peut pas dépasser 100%
     st.metric("% transactions signalées", f"{pct_flagged:.1f}%")
-    st.metric("Période analysée", f"{stats.get('date_range_days', 0)} jours")
+    days = stats.get('date_range_days', 0)
+    period_str = f"{days} jours" if days < 3650 else "⚠️ Dates invalides"
+    st.metric("Période analysée", period_str)
 
 st.markdown("")
 

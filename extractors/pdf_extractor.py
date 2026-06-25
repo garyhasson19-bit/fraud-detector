@@ -1,7 +1,6 @@
 """
-Extracteur PDF de relevés bancaires — version robuste multi-banques.
-Stratégie : essaie 4 méthodes dans l'ordre, prend la meilleure.
-Compatible : BNP, CA, SG, CIC, LCL, Banque Populaire, Caisse d'Épargne, CaixaBank, Boursorama, etc.
+Extracteur PDF de relevés bancaires — version sécurisée avec garde-fous.
+Stratégie : tableaux en priorité, texte en fallback, avec validation stricte.
 """
 
 import pdfplumber
@@ -15,7 +14,13 @@ from dateutil import parser as date_parser
 
 # ── Sécurité ──────────────────────────────────────────────────────────────────
 MAX_FILE_SIZE_MB = 50
-PDF_MAGIC_BYTES = b'%PDF'
+PDF_MAGIC_BYTES  = b'%PDF'
+
+# ── Garde-fous sur les données extraites ──────────────────────────────────────
+DATE_MIN = datetime(2000, 1, 1)   # Aucun relevé avant 2000
+DATE_MAX = datetime(2030, 12, 31) # Aucun relevé après 2030
+MONTANT_MAX_TRANSACTION = 500_000  # Au-delà = probablement un solde cumulé, pas une transaction
+MONTANT_MIN_TRANSACTION = 0.50     # En dessous = bruit (frais centimes ignorés sauf card testing)
 
 
 def _validate_pdf(data: bytes):
@@ -29,68 +34,80 @@ def _validate_pdf(data: bytes):
 
 def clean_amount(raw) -> float | None:
     """
-    Convertit n'importe quelle chaîne de montant en float.
-    Gère : 1 234,56 / 1.234,56 / 1,234.56 / -800 / 800,00 / 1 234.56 etc.
+    Convertit n'importe quel string de montant en float.
+    Gère : 1 234,56 / 1.234,56 / 1,234.56 / -800 / (1500,00) etc.
+    Retourne None si la valeur est hors des garde-fous.
     """
     if raw is None:
         return None
     s = str(raw).strip()
-    if not s or s in ('-', '—', 'N/A', ''):
+    if not s or s in ('-', '—', 'N/A', '', 'none', 'None'):
         return None
 
-    # Supprimer espaces insécables, symboles monétaires, lettres parasite
-    s = s.replace('\xa0', '').replace(' ', '').replace('€', '').replace('EUR', '')
-    s = s.replace(' ', '').replace(' ', '')
+    # Supprimer caractères parasites
+    s = s.replace('\xa0', '').replace(' ', '').replace(' ', '')
+    s = s.replace('€', '').replace('EUR', '').replace(' ', '')
 
-    negative = s.startswith('-') or s.startswith('(') or s.endswith('-')
-    s = s.replace('(', '').replace(')', '').lstrip('-').rstrip('-').strip()
+    negative = s.startswith('-') or (s.startswith('(') and s.endswith(')'))
+    s = s.strip('()').lstrip('+-').strip()
 
-    # Déterminer le séparateur décimal (virgule ou point)
-    # Règle : si le dernier séparateur est une virgule ou un point suivi de 2 chiffres → décimal
-    # Sinon → séparateur de milliers
+    if not s:
+        return None
+
+    # Déterminer le séparateur décimal
     comma_pos = s.rfind(',')
     dot_pos   = s.rfind('.')
 
-    if comma_pos == -1 and dot_pos == -1:
-        # Pas de séparateur → entier
-        try:
+    try:
+        if comma_pos == -1 and dot_pos == -1:
             val = float(s)
-        except ValueError:
-            return None
-    elif comma_pos > dot_pos:
-        # Format européen : 1.234,56 ou 1234,56
-        s = s.replace('.', '').replace(',', '.')
-        try:
-            val = float(s)
-        except ValueError:
-            return None
-    else:
-        # Format anglais : 1,234.56 ou 1234.56
-        s = s.replace(',', '')
-        try:
-            val = float(s)
-        except ValueError:
-            return None
+        elif comma_pos > dot_pos:
+            # Format européen : 1.234,56
+            val = float(s.replace('.', '').replace(',', '.'))
+        else:
+            # Format anglais : 1,234.56
+            val = float(s.replace(',', ''))
+    except ValueError:
+        return None
+
+    # Garde-fous sur le montant
+    if val < 0:
+        val = abs(val)
+        negative = True
+    if val < MONTANT_MIN_TRANSACTION or val > MONTANT_MAX_TRANSACTION:
+        return None
 
     return -val if negative else val
 
 
 def parse_date_safe(raw) -> datetime | None:
+    """Parse une date en acceptant seulement les dates entre 2000 et 2030."""
     if not raw:
         return None
-    raw = str(raw).strip()
-    if not raw or raw.lower() in ('none', '-', ''):
+    s = str(raw).strip()
+    if not s or s.lower() in ('none', '-', '', 'date'):
         return None
+
+    # Doit contenir au moins un chiffre
+    if not any(c.isdigit() for c in s):
+        return None
+
     # Normalise les séparateurs
-    raw = re.sub(r'[\.\-]', '/', raw)
+    s = re.sub(r'[\.\-]', '/', s)
+
     try:
-        return date_parser.parse(raw, dayfirst=True)
+        dt = date_parser.parse(s, dayfirst=True, fuzzy=False)
+        if DATE_MIN <= dt <= DATE_MAX:
+            return dt
+        return None
     except Exception:
         pass
-    # Essaie quelques formats communs
-    for fmt in ('%d/%m/%Y', '%d/%m/%y', '%Y/%m/%d', '%m/%d/%Y'):
+
+    for fmt in ('%d/%m/%Y', '%d/%m/%y', '%Y/%m/%d', '%m/%d/%Y', '%d/%m/%Y', '%Y-%m-%d'):
         try:
-            return datetime.strptime(raw, fmt)
+            dt = datetime.strptime(s.replace('-', '/').replace('.', '/'), fmt)
+            if DATE_MIN <= dt <= DATE_MAX:
+                return dt
         except Exception:
             pass
     return None
@@ -98,145 +115,127 @@ def parse_date_safe(raw) -> datetime | None:
 
 # ── Détection de colonnes ────────────────────────────────────────────────────
 
-DATE_KEYWORDS   = ['date', 'jour', 'date op', 'date val', 'date ope', 'date opé']
-DESC_KEYWORDS   = ['libellé', 'libelle', 'motif', 'opération', 'operation', 'détail',
-                   'detail', 'description', 'label', 'nature', 'désignation', 'designation']
-DEBIT_KEYWORDS  = ['débit', 'debit', 'sortie', 'retrait', 'dépense', 'depense', 'db', 'dbt']
-CREDIT_KEYWORDS = ['crédit', 'credit', 'entrée', 'entree', 'versement', 'recette', 'cr', 'crt']
-AMOUNT_KEYWORDS = ['montant', 'amount', 'valeur', 'solde mouvement', 'mvt']
+DATE_KW   = ['date', 'jour', 'date op', 'date val', 'date ope', 'date opé', 'date opération']
+DESC_KW   = ['libellé', 'libelle', 'motif', 'opération', 'operation', 'détail',
+             'detail', 'description', 'label', 'nature', 'désignation']
+DEBIT_KW  = ['débit', 'debit', 'sortie', 'retrait', 'dépense', 'depense', 'déb', 'deb']
+CREDIT_KW = ['crédit', 'credit', 'entrée', 'entree', 'versement', 'recette', 'cré', 'cred']
+AMOUNT_KW = ['montant', 'amount', 'valeur']
+# Colonnes à IGNORER (contiennent des soldes cumulatifs, pas des transactions)
+SOLDE_KW  = ['solde', 'balance', 'cumul', 'total', 'running']
 
 
-def _find_col(header, keywords):
+def _find_col(header, keywords, exclude=None):
     for i, h in enumerate(header):
         h_low = str(h).lower().strip()
+        if exclude and any(e in h_low for e in exclude):
+            continue
         if any(k in h_low for k in keywords):
             return i
     return None
 
 
-# ── Méthode 1 : extraction par tableaux ─────────────────────────────────────
+def _is_solde_col(header_cell: str) -> bool:
+    return any(k in str(header_cell).lower() for k in SOLDE_KW)
+
+
+# ── Méthode 1 : tableaux structurés ─────────────────────────────────────────
 
 def _extract_tables(pdf_path: str) -> list[dict]:
     rows = []
     with pdfplumber.open(pdf_path) as pdf:
         for page_num, page in enumerate(pdf.pages, 1):
-            # Essaie différentes stratégies de détection de tableaux
-            for strategy in [
-                {"vertical_strategy": "lines", "horizontal_strategy": "lines"},
-                {"vertical_strategy": "text",  "horizontal_strategy": "text"},
-                {"vertical_strategy": "lines", "horizontal_strategy": "text"},
-            ]:
-                try:
-                    tables = page.extract_tables(strategy)
-                except Exception:
-                    tables = page.extract_tables()
+            tables = page.extract_tables()
+            for table in (tables or []):
+                if not table or len(table) < 2:
+                    continue
+                header = [str(c or '').strip() for c in table[0]]
+                header_low = [h.lower() for h in header]
 
-                for table in (tables or []):
-                    if not table or len(table) < 2:
+                col_date   = _find_col(header_low, DATE_KW)
+                col_desc   = _find_col(header_low, DESC_KW)
+                col_debit  = _find_col(header_low, DEBIT_KW,  exclude=SOLDE_KW)
+                col_credit = _find_col(header_low, CREDIT_KW, exclude=SOLDE_KW)
+                col_amount = _find_col(header_low, AMOUNT_KW, exclude=SOLDE_KW)
+
+                # Ignore les colonnes "solde" pour éviter les cumuls
+                solde_cols = {i for i, h in enumerate(header_low) if _is_solde_col(h)}
+
+                if col_date is None:
+                    continue
+                if col_debit is None and col_credit is None and col_amount is None:
+                    continue
+
+                for data_row in table[1:]:
+                    if not data_row:
                         continue
-                    header = [str(c or '').lower().strip() for c in table[0]]
 
-                    col_date   = _find_col(header, DATE_KEYWORDS)
-                    col_desc   = _find_col(header, DESC_KEYWORDS)
-                    col_debit  = _find_col(header, DEBIT_KEYWORDS)
-                    col_credit = _find_col(header, CREDIT_KEYWORDS)
-                    col_amount = _find_col(header, AMOUNT_KEYWORDS)
+                    def safe(i):
+                        if i is None or i >= len(data_row) or i in solde_cols:
+                            return ''
+                        return str(data_row[i] or '').strip()
 
-                    # Il faut au moins une date OU une colonne montant
-                    if col_date is None and col_amount is None and col_debit is None:
+                    # Date
+                    dt = parse_date_safe(safe(col_date))
+                    if dt is None:
                         continue
 
-                    for data_row in table[1:]:
-                        if not data_row or all(not c for c in data_row):
-                            continue
+                    # Description
+                    desc = safe(col_desc)
+                    if not desc:
+                        desc_parts = [
+                            str(data_row[i] or '').strip()
+                            for i in range(len(data_row))
+                            if i not in {col_date, col_debit, col_credit, col_amount} | solde_cols
+                            and str(data_row[i] or '').strip()
+                        ]
+                        desc = ' '.join(desc_parts)[:100] or f"Transaction p.{page_num}"
 
-                        safe = lambda i: str(data_row[i]).strip() if i is not None and i < len(data_row) and data_row[i] else ''
+                    # Montants
+                    debit  = clean_amount(safe(col_debit))  if col_debit  is not None else None
+                    credit = clean_amount(safe(col_credit)) if col_credit is not None else None
 
-                        raw_date = safe(col_date) if col_date is not None else ''
-                        dt = parse_date_safe(raw_date)
-                        if dt is None:
-                            # Cherche une date dans n'importe quelle cellule
-                            for cell in data_row:
-                                dt = parse_date_safe(str(cell or ''))
-                                if dt:
-                                    break
-                        if dt is None:
-                            continue
+                    if debit is None and credit is None and col_amount is not None:
+                        val = clean_amount(safe(col_amount))
+                        if val is not None:
+                            if val < 0:
+                                debit = abs(val)
+                            else:
+                                credit = val
 
-                        desc = safe(col_desc) if col_desc is not None else ''
-                        if not desc:
-                            # Prend la plus longue cellule non-numérique
-                            candidates = [str(c or '').strip() for c in data_row
-                                          if c and not re.match(r'^[\d\s,.\-€+()]+$', str(c).strip())]
-                            desc = max(candidates, key=len) if candidates else f"Transaction p.{page_num}"
+                    if debit is None and credit is None:
+                        continue
 
-                        debit  = clean_amount(safe(col_debit))  if col_debit  is not None else None
-                        credit = clean_amount(safe(col_credit)) if col_credit is not None else None
+                    # Débit et crédit ne peuvent pas être tous les deux positifs et identiques
+                    if debit is not None and credit is not None and debit == credit:
+                        credit = None
 
-                        if debit is None and credit is None and col_amount is not None:
-                            val = clean_amount(safe(col_amount))
-                            if val is not None:
-                                if val < 0:
-                                    debit = abs(val)
-                                else:
-                                    credit = val
+                    amount = -(debit or 0) + (credit or 0)
+                    if amount == 0:
+                        continue
 
-                        # Si toujours rien → scanne toutes les cellules pour un montant
-                        if debit is None and credit is None:
-                            numeric_vals = []
-                            for cell in data_row:
-                                v = clean_amount(str(cell or ''))
-                                if v is not None and abs(v) > 0:
-                                    numeric_vals.append(v)
-                            if len(numeric_vals) == 1:
-                                v = numeric_vals[0]
-                                if v < 0:
-                                    debit = abs(v)
-                                else:
-                                    credit = v
-                            elif len(numeric_vals) >= 2:
-                                # Heuristique : dernier montant positif = crédit, avant-dernier = débit
-                                positives = [v for v in numeric_vals if v > 0]
-                                if len(positives) >= 2:
-                                    debit, credit = positives[0], positives[1]
-                                elif positives:
-                                    credit = positives[-1]
-
-                        if debit is None and credit is None:
-                            continue
-
-                        amount = -(debit or 0) + (credit or 0)
-                        if amount == 0:
-                            continue
-
-                        rows.append({
-                            'date': dt, 'description': desc[:200],
-                            'debit': debit, 'credit': credit, 'amount': amount,
-                            'page': page_num,
-                            'raw_line': ' | '.join(str(c or '') for c in data_row)[:300],
-                        })
-
-                if rows:
-                    break  # Une stratégie a marché pour cette page
-
+                    rows.append({
+                        'date': dt, 'description': desc[:200],
+                        'debit': debit, 'credit': credit, 'amount': amount,
+                        'page': page_num,
+                        'raw_line': ' | '.join(str(c or '') for c in data_row)[:200],
+                    })
     return rows
 
 
-# ── Méthode 2 : extraction par texte brut ────────────────────────────────────
+# ── Méthode 2 : texte ligne par ligne ───────────────────────────────────────
 
-# Regex date : 01/01/2024, 01-01-24, 1 jan 2024, etc.
-RE_DATE = re.compile(
-    r'\b(\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{2,4})'
-    r'|\b(\d{1,2}\s+(?:jan|fév|feb|mar|avr|apr|mai|may|jun|juin|jul|juil|aug|aoû|sep|oct|nov|déc|dec)[a-zé]*\.?\s*\d{2,4})',
+# Formats de date stricts (évite de parser des numéros de compte comme des dates)
+RE_DATE_STRICT = re.compile(
+    r'\b(\d{2}[/\-\.]\d{2}[/\-\.]\d{4})\b'           # 01/01/2024
+    r'|\b(\d{2}[/\-\.]\d{2}[/\-\.]\d{2})\b'           # 01/01/24
+    r'|\b(\d{1,2}\s+(?:jan|fév|feb|mar|avr|apr|mai|may|jun|juin|jul|juil|aug|aoû|sep|oct|nov|déc|dec)[a-zé]*\.?\s*\d{4})\b',
     re.IGNORECASE
 )
 
-# Montant : 1 234,56 / -1234.56 / (1 234,56) / 1234
-RE_AMOUNT = re.compile(
-    r'(?<!\w)'                      # pas précédé d'une lettre
-    r'([+-]?\s*(?:\d{1,3}(?:[\s\xa0]\d{3})*|\d+)(?:[.,]\d{1,2})?)'
-    r'(?:\s*€)?'
-    r'(?!\w)',                      # pas suivi d'une lettre
+# Montant : chiffres avec séparateur décimal obligatoire (évite les numéros bruts)
+RE_AMOUNT_STRICT = re.compile(
+    r'(?<![,\d])([+-]?\s*(?:\d{1,3}(?:[\s\xa0]\d{3})*|\d+)[,\.]\d{2})(?![,\.\d])'
 )
 
 
@@ -244,136 +243,45 @@ def _extract_text(pdf_path: str) -> list[dict]:
     rows = []
     with pdfplumber.open(pdf_path) as pdf:
         for page_num, page in enumerate(pdf.pages, 1):
-            text = page.extract_text(x_tolerance=2, y_tolerance=2) or ''
-            lines = text.split('\n')
-
-            for line in lines:
+            text = page.extract_text(x_tolerance=3, y_tolerance=3) or ''
+            for line in text.split('\n'):
                 line = line.strip()
-                if len(line) < 8:
+                if len(line) < 10:
                     continue
 
-                # Cherche une date
-                dm = RE_DATE.search(line)
+                # Date stricte obligatoire
+                dm = RE_DATE_STRICT.search(line)
                 if not dm:
                     continue
-                raw_date = dm.group(1) or dm.group(2)
+                raw_date = dm.group(1) or dm.group(2) or dm.group(3)
                 dt = parse_date_safe(raw_date)
                 if dt is None:
                     continue
 
-                # Trouve tous les montants
-                amounts_raw = RE_AMOUNT.findall(line)
+                # Montants avec décimales obligatoires
+                amounts_raw = RE_AMOUNT_STRICT.findall(line)
                 amounts = [clean_amount(a) for a in amounts_raw]
-                amounts = [a for a in amounts if a is not None and abs(a) >= 1]
+                amounts = [a for a in amounts if a is not None]
                 if not amounts:
                     continue
 
-                # Description = ligne sans la date et sans les montants
-                desc = RE_DATE.sub('', line)
-                desc = RE_AMOUNT.sub('', desc)
-                desc = re.sub(r'[€\s]{2,}', ' ', desc).strip()
+                # Description
+                desc = RE_DATE_STRICT.sub('', line)
+                desc = RE_AMOUNT_STRICT.sub('', desc)
+                desc = re.sub(r'[€\s]{2,}', ' ', desc).strip()[:150]
                 if not desc:
                     desc = f"Transaction p.{page_num}"
 
-                # Détermine débit/crédit
-                debit = credit = None
-                if len(amounts) == 1:
-                    if amounts[0] < 0:
-                        debit = abs(amounts[0])
-                    else:
-                        credit = amounts[0]
-                elif len(amounts) >= 2:
-                    # Souvent : [débit, solde] ou [crédit, solde]
-                    debit  = amounts[0] if amounts[0] > 0 else None
-                    credit = amounts[1] if len(amounts) > 1 and amounts[1] > 0 and amounts[1] != amounts[0] else None
-
-                if debit is None and credit is None:
-                    continue
-
-                amount = -(debit or 0) + (credit or 0)
-                if amount == 0:
-                    continue
-
-                rows.append({
-                    'date': dt, 'description': desc[:200],
-                    'debit': debit, 'credit': credit, 'amount': amount,
-                    'page': page_num, 'raw_line': line[:300],
-                })
-
-    return rows
-
-
-# ── Méthode 3 : extraction par coordonnées (colonnes alignées) ───────────────
-
-def _extract_by_columns(pdf_path: str) -> list[dict]:
-    """
-    Pour les relevés où texte et montants sont dans des colonnes visuellement alignées.
-    Détecte les colonnes débit/crédit par position horizontale.
-    """
-    rows = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for page_num, page in enumerate(pdf.pages, 1):
-            words = page.extract_words(x_tolerance=5, y_tolerance=5)
-            if not words:
-                continue
-
-            page_width = page.width
-            # Heuristique : montants = mots à droite de la page (> 55% de la largeur)
-            right_words  = [w for w in words if float(w['x0']) > page_width * 0.55]
-            left_words   = [w for w in words if float(w['x0']) <= page_width * 0.55]
-
-            # Groupe par ligne (y0 proche)
-            def group_by_y(word_list, tolerance=4):
-                if not word_list:
-                    return {}
-                lines = {}
-                for w in sorted(word_list, key=lambda x: float(x['top'])):
-                    y = round(float(w['top']) / tolerance) * tolerance
-                    lines.setdefault(y, []).append(w)
-                return lines
-
-            right_lines = group_by_y(right_words)
-            left_lines  = group_by_y(left_words)
-
-            for y, r_words in right_lines.items():
-                # Cherche un montant parmi les mots de droite
-                amounts_in_line = []
-                for w in r_words:
-                    v = clean_amount(w['text'])
-                    if v is not None and abs(v) >= 1:
-                        amounts_in_line.append((v, float(w['x0'])))
-
-                if not amounts_in_line:
-                    continue
-
-                # Cherche une date dans les mots de gauche sur la même ligne (±10px)
-                dt = None
-                desc_words = []
-                for ly, l_words in left_lines.items():
-                    if abs(ly - y) <= 10:
-                        for w in l_words:
-                            d = parse_date_safe(w['text'])
-                            if d and dt is None:
-                                dt = d
-                            else:
-                                desc_words.append(w['text'])
-                if dt is None:
-                    continue
-
-                desc = ' '.join(desc_words).strip() or f"Transaction p.{page_num}"
-
-                # Si 2 montants à droite → colonne débit | colonne crédit (positionnement)
-                if len(amounts_in_line) >= 2:
-                    amounts_sorted = sorted(amounts_in_line, key=lambda x: x[1])
-                    debit  = abs(amounts_sorted[0][0]) if amounts_sorted[0][0] != 0 else None
-                    credit = abs(amounts_sorted[1][0]) if amounts_sorted[1][0] != 0 else None
-                    # Si débit = 0 ou crédit = 0 → ignorer
-                    if debit == 0: debit = None
-                    if credit == 0: credit = None
+                # Détermination débit/crédit
+                # Si 2+ montants : le dernier est souvent le solde → on prend l'avant-dernier
+                if len(amounts) >= 2:
+                    # Heuristique : ignorer le dernier (souvent solde)
+                    val = amounts[-2] if len(amounts) >= 2 else amounts[0]
                 else:
-                    v = amounts_in_line[0][0]
-                    debit  = abs(v) if v < 0 else None
-                    credit = v     if v > 0 else None
+                    val = amounts[0]
+
+                debit  = abs(val) if val < 0 else None
+                credit = val      if val > 0 else None
 
                 if debit is None and credit is None:
                     continue
@@ -383,32 +291,51 @@ def _extract_by_columns(pdf_path: str) -> list[dict]:
                     continue
 
                 rows.append({
-                    'date': dt, 'description': desc[:200],
+                    'date': dt, 'description': desc,
                     'debit': debit, 'credit': credit, 'amount': amount,
-                    'page': page_num, 'raw_line': desc[:300],
+                    'page': page_num, 'raw_line': line[:200],
                 })
     return rows
 
 
-# ── Point d'entrée principal ──────────────────────────────────────────────────
+# ── Post-traitement & dédoublonnage ──────────────────────────────────────────
 
 def _rows_to_df(rows: list[dict]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
+
     df = pd.DataFrame(rows)
     df['date'] = pd.to_datetime(df['date'], errors='coerce')
     df = df.dropna(subset=['date'])
+
+    # Garde-fous supplémentaires
     df = df[df['amount'] != 0]
-    # Dédoublonnage : même date + même montant + même description → garder 1
-    df = df.drop_duplicates(subset=['date', 'amount', 'description'])
+    df = df[df['amount'].abs() >= MONTANT_MIN_TRANSACTION]
+    df = df[df['amount'].abs() <= MONTANT_MAX_TRANSACTION]
+
+    # Dates valides uniquement
+    df = df[(df['date'] >= DATE_MIN) & (df['date'] <= DATE_MAX)]
+
+    if df.empty:
+        return df
+
+    # Dédoublonnage strict
+    df['_amt_r']   = df['amount'].round(2)
+    df['_desc_s']  = df['description'].str.lower().str.strip().str[:40]
+    df = df.drop_duplicates(subset=['date', '_amt_r', '_desc_s'])
+    df = df.drop(columns=['_amt_r', '_desc_s'])
+
     df = df.sort_values('date').reset_index(drop=True)
     df['id'] = df.index + 1
     return df
 
 
+# ── Point d'entrée ────────────────────────────────────────────────────────────
+
 def extract_pdf(uploaded_file) -> pd.DataFrame:
     """
-    Point d'entrée. Essaie 3 méthodes d'extraction et retourne la plus complète.
+    Essaie tableaux puis texte.
+    Garde la méthode qui extrait le plus de transactions VALIDES.
     """
     if isinstance(uploaded_file, str):
         with open(uploaded_file, 'rb') as f:
@@ -424,37 +351,44 @@ def extract_pdf(uploaded_file) -> pd.DataFrame:
 
     try:
         results = {}
-        for name, fn in [
-            ('tables',  _extract_tables),
-            ('text',    _extract_text),
-            ('columns', _extract_by_columns),
-        ]:
+        for name, fn in [('tables', _extract_tables), ('text', _extract_text)]:
             try:
-                rows = fn(tmp_path)
-                df = _rows_to_df(rows)
+                df = _rows_to_df(fn(tmp_path))
                 results[name] = df
             except Exception as e:
+                print(f"[Extractor] {name}: {e}")
                 results[name] = pd.DataFrame()
 
-        # Prend la méthode qui a trouvé le plus de transactions
-        best = max(results.values(), key=len)
+        # Préfère les tableaux si résultats similaires (plus fiables)
+        df_tables = results.get('tables', pd.DataFrame())
+        df_text   = results.get('text',   pd.DataFrame())
 
-        # Si 2 méthodes ont trouvé des résultats, fusionne et dédoublonne
-        non_empty = [df for df in results.values() if not df.empty]
-        if len(non_empty) >= 2:
-            merged = pd.concat(non_empty, ignore_index=True)
-            merged['date'] = pd.to_datetime(merged['date'], errors='coerce')
-            merged = merged.dropna(subset=['date'])
-            merged['amount_round'] = merged['amount'].round(2)
-            merged['desc_short'] = merged['description'].str[:40]
-            merged = merged.drop_duplicates(subset=['date', 'amount_round', 'desc_short'])
-            merged = merged.drop(columns=['amount_round', 'desc_short'], errors='ignore')
+        if df_tables.empty and df_text.empty:
+            return pd.DataFrame()
+
+        if df_tables.empty:
+            return df_text
+        if df_text.empty:
+            return df_tables
+
+        # Si tableaux trouvent au moins 70% de ce que le texte trouve → tableaux
+        if len(df_tables) >= len(df_text) * 0.70:
+            best = df_tables
+        else:
+            # Fusionne les deux et dédoublonne
+            merged = pd.concat([df_tables, df_text], ignore_index=True)
+            merged['_r'] = merged['amount'].round(2)
+            merged['_d'] = merged['description'].str.lower().str.strip().str[:40]
+            merged = merged.drop_duplicates(subset=['date', '_r', '_d'])
+            merged = merged.drop(columns=['_r', '_d'])
             merged = merged.sort_values('date').reset_index(drop=True)
             merged['id'] = merged.index + 1
-            if len(merged) > len(best):
-                return merged
+            best = merged
 
         return best
 
     finally:
-        os.unlink(tmp_path)
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
