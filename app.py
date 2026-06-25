@@ -186,17 +186,6 @@ with st.sidebar:
     opt_stats = st.checkbox("Analyse statistique (MAD)", value=True, help="Détecte les montants aberrants sans Z-score")
 
     st.markdown("---")
-    st.markdown("### 📐 Relevé de référence (optionnel)")
-    st.caption("Uploadez un relevé d'une période **normale connue** pour une analyse comparative précise. L'app apprendra les habitudes de votre entreprise et ne flagguera que les vraies déviations.")
-    ref_file = st.file_uploader(
-        "Relevé de référence (période saine)",
-        type=["pdf"],
-        key="ref_upload",
-        label_visibility="collapsed",
-        help="Un relevé d'une période sans fraude connue — peut être un relevé plus ancien.",
-    )
-
-    st.markdown("---")
     st.markdown("""
     **Confidentialité totale**
     - Tout s'exécute sur votre machine
@@ -211,47 +200,69 @@ with st.sidebar:
 st.markdown("""
 <div class="main-header">
     <h1>🔍 FraudLens</h1>
-    <p>Analyse intelligente de relevés bancaires — Détection de fraude pour TPE/PME</p>
-    <span class="badge">✅ IA intégrée — 100% local — Aucune API requise</span>
+    <p>Détection de fraude bancaire pour entreprises belges — HORECA, commerces, PME</p>
+    <span class="badge">✅ 24 modules ACFE/CTIF · Belgique · 100% local · Aucune API</span>
 </div>
 """, unsafe_allow_html=True)
 
 
-# ── Upload ────────────────────────────────────────────────────────────────────
-st.markdown("## 📄 Importer les relevés bancaires")
-col_up1, col_up2 = st.columns([3, 1])
-with col_up1:
-    uploaded_files = st.file_uploader(
-        "Glissez-déposez vos relevés PDF",
-        type=["pdf"],
-        accept_multiple_files=True,
-        label_visibility="collapsed",
-    )
-with col_up2:
-    st.info("📎 Plusieurs fichiers acceptés\n\nAnalyse croisée automatique")
+# ══════════════════════════════════════════════════════════════════════════════
+# ÉTAPE 1 — RELEVÉ DE RÉFÉRENCE (OBLIGATOIRE)
+# ══════════════════════════════════════════════════════════════════════════════
+st.markdown("## 📐 Étape 1 — Relevé de référence (période normale)")
 
-if not uploaded_files:
+st.markdown("""
+<div style="background:#13172a;border:2px solid #e9456055;border-radius:12px;padding:1.4rem 1.6rem;margin-bottom:1rem">
+    <h4 style="color:#e94560;margin:0 0 0.7rem">⚠️ Étape obligatoire avant toute analyse</h4>
+    <p style="color:#cbd5e1;margin:0 0 0.8rem">
+        Pour détecter les vraies fraudes sans faux positifs, FraudLens doit d'abord apprendre
+        ce qui est <b>normal pour votre entreprise spécifique</b>.
+    </p>
+    <p style="color:#a8b2d8;margin:0;font-size:0.92rem">
+        📂 <b>Quel fichier fournir ?</b> Un relevé bancaire d'une période que vous savez saine
+        (ex : les 3-6 derniers mois sans incident connu, ou l'année précédente).
+        Ce relevé ne sera utilisé que comme référence — aucune alerte ne sera générée dessus.<br><br>
+        🎯 <b>Pourquoi c'est essentiel ?</b> Sans cela, l'app ne sait pas que Metro facture
+        normalement 1 000-1 200€ chez vous, ou que votre loyer est 2 800€.
+        Elle risquerait de tout flagguer. Avec votre référence, elle compare vos habitudes réelles.
+    </p>
+</div>
+""", unsafe_allow_html=True)
+
+ref_col1, ref_col2 = st.columns([3, 1])
+with ref_col1:
+    ref_file_main = st.file_uploader(
+        "Glissez-déposez un relevé de référence (période saine connue)",
+        type=["pdf"],
+        key="ref_main",
+        label_visibility="collapsed",
+        help="Relevé d'une période sans fraude connue. Minimum 1 mois, idéalement 3-6 mois.",
+    )
+with ref_col2:
+    st.info("📅 Idéal : 3 à 6 mois de données\n\nEvite les faux positifs")
+
+# Bloquer si pas de référence
+if ref_file_main is None:
     st.markdown("""
-    <div class="upload-zone">
-        <h3 style="color:#a8b2d8">Importez vos relevés PDF pour commencer</h3>
-        <p style="color:#6272a4">
-            FraudLens extrait automatiquement toutes les transactions<br>
-            et les analyse avec <b>16 modules de détection de fraude intégrés</b>.<br><br>
-            Compatible : BNP Paribas · Crédit Agricole · Société Générale · CIC · LCL · Banque Populaire · CaixaBank · Caisse d'Épargne
+    <div style="background:#1e2640;border-radius:10px;padding:2rem;text-align:center;margin:1.5rem 0">
+        <h3 style="color:#a8b2d8;margin:0 0 0.5rem">⬆️ Uploadez d'abord le relevé de référence</h3>
+        <p style="color:#6272a4;margin:0">
+            L'analyse sera disponible après l'étape 1.<br>
+            Sans référence, impossible de distinguer ce qui est normal pour votre entreprise.
         </p>
     </div>
     """, unsafe_allow_html=True)
 
     st.markdown("---")
-    st.markdown("### 🛡️ Cas de fraude couverts par le moteur intégré")
+    st.markdown("### 🛡️ Ce que FraudLens détecte (24 modules basés sur ACFE 2024 & CTIF Belgique)")
     cas_cols = st.columns(3)
     cas = [
-        ("💸 Fraude interne", ["Doublons de paiement", "Dépenses personnelles", "Virements personnels", "Remboursements suspects"]),
-        ("🏭 Fraude fournisseur", ["Fournisseur fictif", "Première grosse facture", "Concentration excessive", "Surfacturation"]),
-        ("💰 Fraude caisse", ["Retraits espèces élevés", "Montants ronds suspects", "Fractionnement (smurfing)", "Juste sous les seuils"]),
-        ("👔 Fraude paie", ["Employé fantôme", "Doublon de salaire", "Acomptes non autorisés", "Irrégularité mensuelle"]),
-        ("🔍 Anomalies statistiques", ["Z-score aberrant", "Pic de dépenses", "Silence puis reprise", "Distribution anormale"]),
-        ("⚖️ Fraude financière", ["Blanchiment (structuring)", "Virements multiples/jour", "Montants juste sous seuil", "Comportement inhabituel"]),
+        ("💸 Fraude interne", ["Doublons de paiement (ACFE)", "Virements personnels", "Dépenses personnelles sur pro", "Notes de frais excessives"]),
+        ("🏭 Fraude fournisseur", ["Ghost vendor / typosquatting", "Premier gros paiement", "Montant fixe suspect", "Surfacturation progressive"]),
+        ("💰 Fraude caisse / skimming", ["Ratio espèces/CB anormal", "Dépôts ronds suspects", "Retraits > 3 000€ (loi belge)", "Structuring CTIF"]),
+        ("👔 Fraude sur la paie", ["Doublon de salaire", "Salaire parfait = ghost employee", "Inflation salariale", "Virement hors cycle de paie"]),
+        ("🔍 Méthodes statistiques", ["IQR/MAD (pas Z-score)", "Loi de Benford (SPF Finances)", "Pic de dépenses hebdo", "Concentration fin de mois"]),
+        ("⚖️ Blanchiment (CTIF)", ["Structuring 4+ paiements", "Round-tripping", "Threshold clustering", "Virements multiples/jour"]),
     ]
     for i, (titre, items) in enumerate(cas):
         with cas_cols[i % 3]:
@@ -262,24 +273,57 @@ if not uploaded_files:
     st.stop()
 
 
-# ── Baseline (relevé de référence) ───────────────────────────────────────────
+# ── Traitement du relevé de référence ────────────────────────────────────────
 baseline = {}
-if ref_file is not None:
-    with st.spinner("Apprentissage de la baseline (relevé de référence)..."):
-        try:
-            df_ref = extract_pdf(ref_file)
-            if not df_ref.empty:
-                baseline = build_baseline(df_ref)
-                bsum = baseline_summary(baseline)
-                st.success(
-                    f"✅ Baseline apprise : **{bsum['n_vendors']} fournisseurs** connus · "
-                    f"Dépenses mensuelles normales : **{bsum['avg_monthly_out']:,.0f}€** · "
-                    f"Ratio recettes/dépenses : **{bsum['credit_debit_ratio']:.2f}**"
-                )
-            else:
-                st.warning("Impossible d'extraire la baseline. L'analyse continuera sans comparaison de référence.")
-        except Exception as e:
-            st.warning(f"Erreur baseline : {e}")
+with st.spinner("Apprentissage des habitudes normales de votre entreprise..."):
+    try:
+        df_ref = extract_pdf(ref_file_main)
+        if not df_ref.empty:
+            baseline = build_baseline(df_ref)
+            bsum = baseline_summary(baseline)
+            n_months_ref = max(1, (df_ref['date'].max() - df_ref['date'].min()).days // 30)
+            st.success(
+                f"✅ Référence apprise — **{len(df_ref)} transactions** sur ~{n_months_ref} mois · "
+                f"**{bsum['n_vendors']} fournisseurs** connus · "
+                f"Dépenses normales : **{bsum['avg_monthly_out']:,.0f}€/mois** · "
+                f"Montant médian : **{bsum['amount_median']:,.0f}€**"
+            )
+        else:
+            st.error("Impossible d'extraire les transactions du relevé de référence. Vérifiez que le PDF n'est pas protégé.")
+            st.stop()
+    except Exception as e:
+        st.error(f"Erreur lors de la lecture du relevé de référence : {e}")
+        st.stop()
+
+st.markdown("---")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ÉTAPE 2 — RELEVÉ(S) À ANALYSER
+# ══════════════════════════════════════════════════════════════════════════════
+st.markdown("## 🔍 Étape 2 — Relevé(s) à analyser")
+
+col_up1, col_up2 = st.columns([3, 1])
+with col_up1:
+    uploaded_files = st.file_uploader(
+        "Glissez-déposez les relevés à analyser",
+        type=["pdf"],
+        accept_multiple_files=True,
+        key="analyze_upload",
+        label_visibility="collapsed",
+    )
+with col_up2:
+    st.info("📎 Plusieurs fichiers acceptés\n\nAnalyse croisée automatique")
+
+if not uploaded_files:
+    st.markdown("""
+    <div style="background:#1e2640;border-radius:10px;padding:1.5rem;text-align:center">
+        <h3 style="color:#00d4aa;margin:0 0 0.4rem">✅ Référence chargée</h3>
+        <p style="color:#a8b2d8;margin:0">
+            Uploadez maintenant le ou les relevés de la période à analyser.
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+    st.stop()
 
 
 # ── Extraction ────────────────────────────────────────────────────────────────
@@ -328,12 +372,11 @@ with st.spinner("Analyse en cours — 14 modules de détection calibrés ACFE/TR
         if not mad_flags.empty:
             flags_df = pd.concat([flags_df, mad_flags], ignore_index=True) if not flags_df.empty else mad_flags
 
-    # Comparaison baseline si disponible
-    if baseline:
-        baseline_flags = compare_to_baseline(df, baseline)
-        if baseline_flags:
-            baseline_df = pd.DataFrame(baseline_flags)
-            flags_df = pd.concat([flags_df, baseline_df], ignore_index=True) if not flags_df.empty else baseline_df
+    # Comparaison avec la baseline (toujours disponible maintenant — étape obligatoire)
+    baseline_flags = compare_to_baseline(df, baseline)
+    if baseline_flags:
+        baseline_df = pd.DataFrame(baseline_flags)
+        flags_df = pd.concat([flags_df, baseline_df], ignore_index=True) if not flags_df.empty else baseline_df
 
     if not flags_df.empty and 'transaction_id' in flags_df.columns:
         flags_df = flags_df.drop_duplicates(subset=['transaction_id', 'rule'])
