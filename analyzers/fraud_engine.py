@@ -22,6 +22,7 @@ Belgique — seuils spécifiques :
 22 patterns de fraude couverts, chacun avec signal précis documenté.
 """
 
+import re
 import pandas as pd
 import numpy as np
 from datetime import timedelta
@@ -948,6 +949,202 @@ def cas_fin_de_periode(df):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# GROUPE I — PIRATAGE / ACCOUNT TAKEOVER (nouvelles règles)
+# Scénario réel : un employé ou une personne externe a accès aux identifiants
+# et fait des virements en cachette pour voler de l'argent.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def cas_virement_hors_heures(df):
+    """
+    Virement sortant effectué en dehors des heures de bureau (avant 7h ou après 22h).
+    Un compte professionnel ne devrait JAMAIS avoir de virement initié à 2h du matin.
+    Utilisé uniquement si les transactions ont une heure précise (timestamp).
+
+    Pattern account takeover documenté : le pirate agit la nuit ou le week-end
+    quand personne ne surveille, pour avoir le temps de transférer avant détection.
+    """
+    flags = []
+    if 'date' not in df.columns:
+        return []
+
+    # Vérifier si on a des heures réelles (pas juste des dates à 00:00:00)
+    has_time = df['date'].apply(lambda d: d.hour != 0 or d.minute != 0).any()
+    if not has_time:
+        return []
+
+    for _, row in df.iterrows():
+        if row['amount'] >= 0:
+            continue
+        h   = row['date'].hour
+        mn  = row['date'].minute
+        amt = abs(row['amount'])
+        if amt < 200:
+            continue
+        # Ignorer les timestamps 00:00:00 — ce sont des dates sans heure réelle
+        if h == 0 and mn == 0:
+            continue
+
+        is_weekend = row['date'].weekday() >= 5
+
+        if h < 6 or h >= 23:
+            flags.append(_flag(row, 92,
+                f"Virement nocturne — {h:02d}h{row['date'].minute:02d} ({amt:,.0f}€)",
+                f"Virement de {amt:,.0f}€ à {h:02d}h{row['date'].minute:02d}. "
+                f"Aucun virement professionnel légitime n'est initié la nuit. "
+                f"Signal caractéristique d'un piratage de compte (account takeover). "
+                f"Vérifier immédiatement qui avait accès aux identifiants bancaires.",
+                "piratage"))
+        elif is_weekend and amt >= 1_000:
+            flags.append(_flag(row, 78,
+                f"Virement week-end — {row['date'].strftime('%A')} {amt:,.0f}€",
+                f"Virement de {amt:,.0f}€ un {row['date'].strftime('%A')}. "
+                f"Pour un compte pro, les virements le week-end sont inhabituels. "
+                f"À surveiller si récurrent.",
+                "piratage"))
+    return flags
+
+
+def cas_test_puis_gros_virement(df):
+    """
+    Petite transaction test (1-50€) suivie d'un gros virement vers le même bénéficiaire
+    dans les 48 heures. Pattern classique de card testing / account takeover.
+
+    Méthode : un pirate envoie d'abord 1€ ou 5€ pour vérifier que le compte fonctionne,
+    puis vide le compte le lendemain.
+    """
+    flags = []
+    debits = df[df['amount'] < 0].copy().sort_values('date')
+    if debits.empty:
+        return []
+    debits['desc_norm'] = debits['description'].str.lower().str.strip().str[:50]
+
+    for _, test_row in debits[debits['amount'].abs() <= 50].iterrows():
+        test_amt = abs(float(test_row['amount']))
+        # Chercher un gros virement vers le même bénéficiaire dans les 48h
+        follow_up = debits[
+            (debits['desc_norm'] == test_row['desc_norm']) &
+            (debits['amount'].abs() >= 200) &
+            (debits['date'] > test_row['date']) &
+            (debits['date'] <= test_row['date'] + timedelta(hours=48))
+        ]
+        if not follow_up.empty:
+            for _, big_row in follow_up.iterrows():
+                flags.append(_flag(big_row, 90,
+                    f"Test ({test_amt:.2f}€) + gros virement ({abs(big_row['amount']):,.0f}€)",
+                    f"Transaction test de {test_amt:.2f}€ le "
+                    f"{test_row['date'].strftime('%d/%m/%Y')} vers "
+                    f"'{test_row['description'][:40]}', suivie de {abs(big_row['amount']):,.0f}€ "
+                    f"dans les 48h. "
+                    f"Pattern classique de vérification de compte avant vol (card testing). "
+                    f"Vérifier si ce bénéficiaire est connu et autorisé.",
+                    "piratage"))
+    return _dedup(flags)
+
+
+def cas_iban_modifie_fournisseur(df):
+    """
+    Même description de fournisseur mais IBAN différent d'un paiement à l'autre.
+    Technique : Man-in-the-Middle sur facture PDF — le fraudeur intercepte la facture,
+    change le numéro de compte, renvoie au client. La victime paie le bon montant
+    mais vers le mauvais compte (celui du fraudeur).
+
+    Signal : même libellé, montants similaires, mais IBANs différents dans la description.
+    """
+    flags = []
+    debits = df[df['amount'] < 0].copy()
+    if debits.empty:
+        return []
+
+    # Extraire les IBANs des descriptions
+    iban_re = re.compile(r'BE\d{2}[\s]?\d{4}[\s]?\d{4}[\s]?\d{4}', re.IGNORECASE)
+    debits['iban_in_desc'] = debits['description'].apply(
+        lambda d: iban_re.findall(d.replace(' ', ''))
+    )
+    debits['has_iban'] = debits['iban_in_desc'].apply(lambda x: len(x) > 0)
+    debits['desc_norm'] = debits['description'].str.lower().str.strip().str[:40]
+
+    # Retirer les IBANs de la description pour avoir le libellé "pur"
+    debits['desc_no_iban'] = debits['description'].apply(
+        lambda d: iban_re.sub('', d).strip()[:40].lower()
+    )
+
+    for desc, group in debits[debits['has_iban']].groupby('desc_no_iban'):
+        if len(group) < 2:
+            continue
+        all_ibans = set()
+        for _, row in group.iterrows():
+            all_ibans.update(row['iban_in_desc'])
+        if len(all_ibans) > 1:
+            for _, row in group.iterrows():
+                flags.append(_flag(row, 88,
+                    "IBAN modifié — même fournisseur, compte différent",
+                    f"'{desc[:45]}' : {len(all_ibans)} IBANs différents détectés "
+                    f"sur {len(group)} paiements. "
+                    f"Technique Man-in-the-Middle sur facture : quelqu'un a modifié le numéro "
+                    f"de compte du fournisseur. Vérifier chaque IBAN par appel téléphonique direct.",
+                    "piratage"))
+    return _dedup(flags)
+
+
+def cas_virement_vers_neobanque(df):
+    """
+    Virement professionnel vers une néobanque (Revolut, N26, Wise, Bunq...).
+    Un vrai fournisseur belge a un IBAN chez KBC, Belfius, BNP Fortis, ING...
+    Un compte Revolut ou Wise = signal fort de fraude ou fournisseur fictif.
+
+    BIC des néobanques actives en Belgique (Febelfin 2024) :
+    - Wise (Transferwise) : TRWIBEB1
+    - Revolut : REVOIE23 / REVOGB21
+    - Bunq : BUNQNL2A
+    - N26 : NTSBDEB1
+    - Lydia : LYDIFRP1
+    - Monzo : MONZGB2L
+    """
+    # IBANs et BICs de néobanques dans les descriptions
+    neobank_patterns = [
+        'revolut', 'n26', 'wise', 'transferwise', 'bunq', 'lydia', 'monzo',
+        'paypal', 'stripe', 'paysera', 'curve', 'starling',
+        # BICs spécifiques
+        'trwibeb', 'revoie', 'revogb', 'bunqnl', 'ntsbde', 'monzgb',
+        # IBANs hors Belgique avec grosse somme = suspect pour PME locale
+    ]
+    # IBANs non-belges pour entreprise qui fait tout local
+    iban_etranger_re = re.compile(r'\b(?!BE)[A-Z]{2}\d{2}[A-Z0-9]{8,}', re.IGNORECASE)
+
+    flags = []
+    for _, row in df.iterrows():
+        if row['amount'] >= 0 or abs(row['amount']) < 100:
+            continue
+        desc_low = row['description'].lower()
+        amt = abs(row['amount'])
+
+        # Vérifier néobanque explicite
+        for pat in neobank_patterns:
+            if pat in desc_low:
+                flags.append(_flag(row, 85,
+                    f"Virement vers néobanque ({pat.capitalize()}) — {amt:,.0f}€",
+                    f"'{row['description'][:60]}' : virement de {amt:,.0f}€ vers "
+                    f"une néobanque ({pat.capitalize()}). "
+                    f"Un vrai fournisseur belge n'a pas de compte Revolut/N26/Wise. "
+                    f"Signal fort : fournisseur fictif ou fraude interne. "
+                    f"Vérifier le numéro d'entreprise (BCE) du bénéficiaire.",
+                    "piratage"))
+                break
+
+        # IBAN étranger + gros montant pour PME locale
+        if amt >= 2_000 and iban_etranger_re.search(row['description']):
+            # Exclure si c'est clairement un gros fournisseur connu international
+            mots_legitimes = ['amazon', 'google', 'microsoft', 'apple', 'booking', 'airbnb']
+            if not any(m in desc_low for m in mots_legitimes):
+                flags.append(_flag(row, 72,
+                    f"Virement vers IBAN étranger — {amt:,.0f}€",
+                    f"'{row['description'][:60]}' : IBAN non-belge détecté. "
+                    f"Pour une PME locale, vérifier si ce paiement international est attendu.",
+                    "piratage"))
+    return _dedup(flags)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # HELPERS & MOTEUR PRINCIPAL
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1017,6 +1214,11 @@ ALL_RULES = [
     # Patterns temporels
     cas_pic_depenses_mad,
     cas_fin_de_periode,
+    # Piratage / account takeover
+    cas_virement_hors_heures,
+    cas_test_puis_gros_virement,
+    cas_iban_modifie_fournisseur,
+    cas_virement_vers_neobanque,
 ]
 
 
@@ -1038,6 +1240,7 @@ def run_engine(df: pd.DataFrame) -> pd.DataFrame:
 
 
 CATEGORIES_FR = {
+    'piratage':             "🚨 Piratage / Accès non autorisé (account takeover)",
     'fraude_interne':       "Fraude interne (employés / dirigeants)",
     'fraude_fournisseur':   "Fraude fournisseur (ghost vendors, surfacturation)",
     'fraude_caisse':        "Fraude caisse / espèces (skimming)",
