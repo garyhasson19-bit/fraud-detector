@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from extractors.pdf_extractor import extract_pdf
 from analyzers.fraud_engine import run_engine, generate_report, compute_risk_score
 from analyzers.stats_analyzer import run_all_stats
+from analyzers.baseline_comparator import build_baseline, compare_to_baseline, baseline_summary
 from utils.report_generator import generate_excel_report
 
 
@@ -181,18 +182,29 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("### Modules d'analyse")
-    opt_rules = st.checkbox("Règles métier (27 cas)", value=True)
-    opt_stats = st.checkbox("Analyse statistique", value=True)
+    opt_rules = st.checkbox("Règles métier", value=True, help="14 règles de détection calibrées ACFE/TRACFIN")
+    opt_stats = st.checkbox("Analyse statistique (MAD)", value=True, help="Détecte les montants aberrants sans Z-score")
+
+    st.markdown("---")
+    st.markdown("### 📐 Relevé de référence (optionnel)")
+    st.caption("Uploadez un relevé d'une période **normale connue** pour une analyse comparative précise. L'app apprendra les habitudes de votre entreprise et ne flagguera que les vraies déviations.")
+    ref_file = st.file_uploader(
+        "Relevé de référence (période saine)",
+        type=["pdf"],
+        key="ref_upload",
+        label_visibility="collapsed",
+        help="Un relevé d'une période sans fraude connue — peut être un relevé plus ancien.",
+    )
 
     st.markdown("---")
     st.markdown("""
     **Confidentialité totale**
     - Tout s'exécute sur votre machine
-    - Aucune donnée n'est envoyée sur internet
+    - Aucune donnée envoyée sur internet
     - Aucun compte ou API requis
     """)
     st.markdown("---")
-    st.caption("FraudLens v2.0 — IA intégrée 100% locale")
+    st.caption("FraudLens v5.0 — IA intégrée 100% locale")
 
 
 # ── Header ────────────────────────────────────────────────────────────────────
@@ -250,6 +262,26 @@ if not uploaded_files:
     st.stop()
 
 
+# ── Baseline (relevé de référence) ───────────────────────────────────────────
+baseline = {}
+if ref_file is not None:
+    with st.spinner("Apprentissage de la baseline (relevé de référence)..."):
+        try:
+            df_ref = extract_pdf(ref_file)
+            if not df_ref.empty:
+                baseline = build_baseline(df_ref)
+                bsum = baseline_summary(baseline)
+                st.success(
+                    f"✅ Baseline apprise : **{bsum['n_vendors']} fournisseurs** connus · "
+                    f"Dépenses mensuelles normales : **{bsum['avg_monthly_out']:,.0f}€** · "
+                    f"Ratio recettes/dépenses : **{bsum['credit_debit_ratio']:.2f}**"
+                )
+            else:
+                st.warning("Impossible d'extraire la baseline. L'analyse continuera sans comparaison de référence.")
+        except Exception as e:
+            st.warning(f"Erreur baseline : {e}")
+
+
 # ── Extraction ────────────────────────────────────────────────────────────────
 with st.spinner("Extraction des transactions depuis les PDF..."):
     all_dfs = []
@@ -282,7 +314,7 @@ st.success(f"✅ **{len(df):,} transactions** extraites depuis **{len(all_dfs)} 
 
 
 # ── Analyse ───────────────────────────────────────────────────────────────────
-with st.spinner("Analyse en cours — 27 modules de détection..."):
+with st.spinner("Analyse en cours — 14 modules de détection calibrés ACFE/TRACFIN..."):
     stats_results = run_all_stats(df)
     stats = stats_results.get('stats', {})
     monthly = stats_results.get('monthly', pd.DataFrame())
@@ -295,6 +327,13 @@ with st.spinner("Analyse en cours — 27 modules de détection..."):
         mad_flags = stats_results.get('mad_flags', pd.DataFrame())
         if not mad_flags.empty:
             flags_df = pd.concat([flags_df, mad_flags], ignore_index=True) if not flags_df.empty else mad_flags
+
+    # Comparaison baseline si disponible
+    if baseline:
+        baseline_flags = compare_to_baseline(df, baseline)
+        if baseline_flags:
+            baseline_df = pd.DataFrame(baseline_flags)
+            flags_df = pd.concat([flags_df, baseline_df], ignore_index=True) if not flags_df.empty else baseline_df
 
     if not flags_df.empty and 'transaction_id' in flags_df.columns:
         flags_df = flags_df.drop_duplicates(subset=['transaction_id', 'rule'])
