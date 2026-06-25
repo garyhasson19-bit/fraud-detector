@@ -182,8 +182,8 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("### Modules d'analyse")
-    opt_rules = st.checkbox("Règles métier", value=True, help="14 règles de détection calibrées ACFE/TRACFIN")
-    opt_stats = st.checkbox("Analyse statistique (MAD)", value=True, help="Détecte les montants aberrants sans Z-score")
+    opt_rules = st.checkbox("Règles métier (24 modules)", value=True, help="24 règles calibrées ACFE 2024 & CTIF Belgique")
+    opt_stats = st.checkbox("Analyse statistique (MAD/Benford)", value=True, help="IQR/MAD robuste + Loi de Benford si >200 transactions")
 
     st.markdown("---")
     st.markdown("""
@@ -358,7 +358,7 @@ st.success(f"✅ **{len(df):,} transactions** extraites depuis **{len(all_dfs)} 
 
 
 # ── Analyse ───────────────────────────────────────────────────────────────────
-with st.spinner("Analyse en cours — 14 modules de détection calibrés ACFE/TRACFIN..."):
+with st.spinner("Analyse en cours — 24 modules de détection ACFE 2024 & CTIF Belgique..."):
     stats_results = run_all_stats(df)
     stats = stats_results.get('stats', {})
     monthly = stats_results.get('monthly', pd.DataFrame())
@@ -844,4 +844,13 @@ with c2:
         st.info("Aucune alerte à exporter.")
 
 st.markdown("---")
-st.caption("FraudLens v2.0 — Analyse 100% locale · Aucune donnée envoyée · Aucune API requise")
+st.markdown("""
+<div style="background:#0d1117;border-top:1px solid #2d3561;padding:1.2rem;border-radius:8px;margin-top:1rem">
+<p style="color:#6272a4;font-size:0.82rem;margin:0;text-align:center">
+<b style="color:#a8b2d8">FraudLens v6.1</b> — Analyse 100% locale · Aucune donnée envoyée sur internet · Aucune API requise<br>
+<b>⚠️ Avertissement légal :</b> FraudLens est un outil d'aide à la détection d'anomalies. Il ne remplace pas un audit professionnel, un expert-comptable forensique ou un conseiller juridique.
+Toute décision basée sur ces analyses doit être validée par un professionnel qualifié.<br>
+<b>🔒 Confidentialité (RGPD/AVG) :</b> Vos relevés bancaires sont traités uniquement sur votre appareil ou serveur. Aucune donnée financière n'est transmise, stockée ou partagée.
+</p>
+</div>
+""", unsafe_allow_html=True)
