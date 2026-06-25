@@ -439,6 +439,354 @@ def cas_virements_multiples_meme_jour(df):
     return _dedup(flags)
 
 
+# ─── Nouveaux cas basés sur recherches forensiques ACFE / TRACFIN ─────────────
+
+def cas_loi_benford(df):
+    """
+    LOI DE BENFORD — Les premiers chiffres des montants doivent suivre une distribution naturelle.
+    Utilisée par l'ACFE, le fisc américain (IRS) et l'administration fiscale française.
+    Si les chiffres 7/8/9 sont surreprésentés → fabrication de montants probable.
+    """
+    if len(df) < 50:
+        return []
+
+    amounts = df['amount'].abs()
+    amounts = amounts[amounts >= 10]
+    if len(amounts) < 50:
+        return []
+
+    first_digits = amounts.apply(lambda x: int(str(x).replace('.', '').replace(',', '').lstrip('0')[0]))
+    observed = first_digits.value_counts(normalize=True).sort_index()
+
+    # Distribution théorique de Benford
+    benford = {d: np.log10(1 + 1/d) for d in range(1, 10)}
+
+    flags = []
+    for digit in range(7, 10):  # 7, 8, 9 sont les plus suspects si surreprésentés
+        obs = observed.get(digit, 0)
+        exp = benford[digit]
+        if obs > exp * 2.5:
+            pct_obs = obs * 100
+            pct_exp = exp * 100
+            suspicious_txns = df[df['amount'].abs().apply(
+                lambda x: str(x).replace('.', '').lstrip('0')[:1] == str(digit)
+            )]
+            for _, row in suspicious_txns.head(10).iterrows():
+                flags.append(_flag(
+                    row, 80,
+                    f"Loi de Benford — chiffre {digit} anormal",
+                    f"Le chiffre '{digit}' apparaît en tête de {pct_obs:.1f}% des montants "
+                    f"(normal: {pct_exp:.1f}%). Technique de détection utilisée par le fisc et l'ACFE. "
+                    "Indique une possible fabrication de montants.",
+                    "fraude_financiere"
+                ))
+    return _dedup(flags)
+
+
+def cas_micro_transactions(df):
+    """
+    CARD TESTING / TEST DE CARTE — Très nombreuses petites transactions vers un même bénéficiaire.
+    Technique utilisée pour tester si une carte volée fonctionne avant une grosse fraude.
+    """
+    flags = []
+    df_small = df[df['amount'].abs() < 10].copy()
+    if len(df_small) < 5:
+        return []
+
+    df_small['desc_norm'] = df_small['description'].str.lower().str.strip().str[:60]
+    by_vendor = df_small.groupby('desc_norm').size()
+
+    for vendor, count in by_vendor.items():
+        if count >= 5:
+            vendor_txns = df_small[df_small['desc_norm'] == vendor]
+            for _, row in vendor_txns.iterrows():
+                flags.append(_flag(
+                    row, 75,
+                    "Test de carte suspect (micro-transactions)",
+                    f"{count} transactions inférieures à 10€ vers '{vendor[:40]}'. "
+                    "Pattern classique de 'card testing' : test d'une carte volée avec de petits montants "
+                    "avant une tentative de fraude importante.",
+                    "fraude_financiere"
+                ))
+    return _dedup(flags)
+
+
+def cas_transactions_circulaires(df):
+    """
+    BLANCHIMENT — Argent qui sort puis revient (aller-retour).
+    Signe possible de blanchiment ou de gonflement artificiel du chiffre d'affaires.
+    """
+    flags = []
+    df = df.copy().sort_values('date')
+    df['desc_norm'] = df['description'].str.lower().str.strip().str[:60]
+    df['abs_amount'] = df['amount'].abs()
+
+    for i, row_out in df[df['amount'] < 0].iterrows():
+        amt = row_out['abs_amount']
+        if amt < 500:
+            continue
+        # Cherche un crédit du même montant dans les 30 jours suivants
+        window = df[
+            (df['amount'] > 0) &
+            (df['abs_amount'].between(amt * 0.95, amt * 1.05)) &
+            (df['date'] > row_out['date']) &
+            (df['date'] <= row_out['date'] + timedelta(days=30))
+        ]
+        if not window.empty:
+            flags.append(_flag(
+                row_out, 85,
+                "Transaction circulaire (aller-retour)",
+                f"Débit de {amt:.2f}€ suivi d'un crédit quasi-identique "
+                f"({window.iloc[0]['amount']:.2f}€) dans les 30 jours. "
+                "Schéma caractéristique du blanchiment ou du gonflement artificiel du CA.",
+                "fraude_financiere"
+            ))
+    return _dedup(flags)
+
+
+def cas_inflation_salaires(df):
+    """
+    FRAUDE PAIE — Augmentations progressives de salaires non justifiées (paie padding).
+    Chaque mois le salaire augmente légèrement — invisible individuellement, énorme sur l'année.
+    """
+    mots_salaire = ['salaire', 'paie', 'acompte', 'avance salaire', 'salarie', 'paye']
+    flags = []
+    sal_rows = [row for _, row in df.iterrows()
+                if any(m in row['description'].lower() for m in mots_salaire) and row['amount'] < 0]
+
+    if len(sal_rows) < 3:
+        return []
+
+    sal_df = pd.DataFrame(sal_rows).sort_values('date')
+    sal_df['month'] = sal_df['date'].dt.to_period('M')
+    sal_df['desc_norm'] = sal_df['description'].str.lower().str.strip().str[:60]
+
+    for emp, group in sal_df.groupby('desc_norm'):
+        if len(group) < 3:
+            continue
+        group = group.sort_values('date')
+        amounts = group['amount'].abs().values
+        # Détecte une tendance à la hausse régulière
+        diffs = np.diff(amounts)
+        if np.all(diffs > 0) and diffs.mean() > 50:
+            total_drift = amounts[-1] - amounts[0]
+            for _, row in group.iterrows():
+                flags.append(_flag(
+                    row, 78,
+                    "Inflation progressive de salaire",
+                    f"Le salaire de '{emp[:40]}' augmente de {diffs.mean():.0f}€ par mois en moyenne "
+                    f"(+{total_drift:.0f}€ au total sur la période). "
+                    "Sans avenant signé, c'est un signe de manipulation de paie.",
+                    "fraude_paie"
+                ))
+    return _dedup(flags)
+
+
+def cas_fournisseur_similaire(df):
+    """
+    FRAUDE FOURNISSEUR — Deux fournisseurs au nom quasi-identique (typosquatting, fournisseur fantôme).
+    Ex: 'METRO CASH' et 'METRO CASHS' — l'un est réel, l'autre est fictif.
+    """
+    flags = []
+    df = df.copy()
+    df['desc_norm'] = df['description'].str.lower().str.strip().str[:50]
+    vendors = df[df['amount'] < 0]['desc_norm'].unique().tolist()
+
+    from difflib import SequenceMatcher
+
+    def similarity(a, b):
+        return SequenceMatcher(None, a, b).ratio()
+
+    seen_pairs = set()
+    for i, v1 in enumerate(vendors):
+        for v2 in vendors[i+1:]:
+            if len(v1) < 5 or len(v2) < 5:
+                continue
+            pair = tuple(sorted([v1, v2]))
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            sim = similarity(v1, v2)
+            if 0.80 <= sim < 1.0:
+                for vendor in [v1, v2]:
+                    txns = df[df['desc_norm'] == vendor]
+                    for _, row in txns.iterrows():
+                        flags.append(_flag(
+                            row, 80,
+                            "Fournisseurs au nom similaire (suspect)",
+                            f"'{v1[:35]}' et '{v2[:35]}' ont des noms quasi-identiques "
+                            f"(similarité: {sim*100:.0f}%). "
+                            "Technique classique du fournisseur fictif — vérifier les SIRET.",
+                            "fraude_fournisseur"
+                        ))
+    return _dedup(flags)
+
+
+def cas_fin_de_periode(df):
+    """
+    MANIPULATION COMPTABLE — Pic de transactions en toute fin de mois.
+    Technique classique pour gonfler ou vider les comptes avant clôture comptable.
+    """
+    flags = []
+    df = df.copy()
+    df['day_of_month'] = df['date'].dt.day
+    df['month'] = df['date'].dt.to_period('M')
+
+    fin_mois = df[df['day_of_month'] >= 28]
+    if fin_mois.empty:
+        return []
+
+    avg_daily = df['amount'].abs().sum() / max(df['date'].nunique(), 1)
+
+    for month, group in fin_mois.groupby('month'):
+        total = group['amount'].abs().sum()
+        n_days = len(group['day_of_month'].unique())
+        if n_days == 0:
+            continue
+        avg_end = total / n_days
+        if avg_end > avg_daily * 4 and total > 2000:
+            for _, row in group.iterrows():
+                flags.append(_flag(
+                    row, 70,
+                    "Pic de transactions en fin de mois",
+                    f"Activité 4x supérieure à la normale les derniers jours de {month}. "
+                    "Technique de manipulation comptable courante avant clôture.",
+                    "anomalie_depenses"
+                ))
+    return _dedup(flags)
+
+
+def cas_frais_rembourses_excessifs(df):
+    """
+    FRAUDE INTERNE — Trop de remboursements de frais (notes de frais fictives).
+    L'une des fraudes les plus courantes selon l'ACFE : 21% des cas en PME.
+    """
+    mots_frais = ['frais', 'note de frais', 'remb frais', 'expense', 'ndf', 'indemnite', 'indemnité']
+    flags = []
+    frais_txns = [row for _, row in df.iterrows()
+                  if any(m in row['description'].lower() for m in mots_frais) and row['amount'] < 0]
+
+    if not frais_txns:
+        return []
+
+    total_frais = sum(abs(r['amount']) for r in frais_txns)
+    total_debits = df[df['amount'] < 0]['amount'].abs().sum()
+
+    pct = total_frais / total_debits * 100 if total_debits > 0 else 0
+
+    if pct > 15 or total_frais > 3000:
+        for row in frais_txns:
+            flags.append(_flag(
+                row, 72,
+                "Remboursements de frais excessifs",
+                f"Les notes de frais totalisent {total_frais:.2f}€ ({pct:.1f}% des dépenses). "
+                "Selon l'ACFE, les fausses notes de frais représentent 21% des fraudes en PME. "
+                "Demander les justificatifs originaux.",
+                "fraude_interne"
+            ))
+    return _dedup(flags)
+
+
+def cas_paiements_inconnus_recurrents(df):
+    """
+    ABONNEMENTS CACHÉS / PRÉLÈVEMENTS NON AUTORISÉS — Petits montants réguliers vers inconnus.
+    Fraude très fréquente : abonnements souscrits à l'insu de l'entreprise, ou virements détournés.
+    """
+    flags = []
+    debits = df[df['amount'] < 0].copy()
+    debits['desc_norm'] = debits['description'].str.lower().str.strip().str[:60]
+    debits['month'] = debits['date'].dt.to_period('M')
+
+    by_vendor = debits.groupby('desc_norm')
+    for vendor, group in by_vendor:
+        months_active = group['month'].nunique()
+        total = group['amount'].abs().sum()
+        avg = group['amount'].abs().mean()
+
+        # Petit montant, récurrent sur plusieurs mois, pas connu comme fournisseur principal
+        if months_active >= 3 and 10 < avg < 500 and total > 200:
+            # Vérifier que ce fournisseur n'est pas parmi les tops (donc il est discret)
+            all_vendors_total = debits.groupby('desc_norm')['amount'].sum().abs()
+            rank = (all_vendors_total > all_vendors_total[vendor]).sum() + 1
+            if rank > len(all_vendors_total) * 0.4:  # Dans le bas du classement = discret
+                for _, row in group.iterrows():
+                    flags.append(_flag(
+                        row, 65,
+                        "Prélèvement récurrent non identifié",
+                        f"'{vendor[:40]}' prélève {avg:.0f}€/mois depuis {months_active} mois "
+                        f"(total: {total:.0f}€). Abonnement non autorisé ou prélèvement détourné possible.",
+                        "fraude_interne"
+                    ))
+    return _dedup(flags)
+
+
+def cas_surfacturation_progressive(df):
+    """
+    FRAUDE FOURNISSEUR — Un fournisseur régulier qui augmente progressivement ses montants.
+    Technique discrète : +5% par mois passe inaperçu, mais sur un an = +80%.
+    """
+    flags = []
+    debits = df[df['amount'] < 0].copy()
+    if len(debits) < 6:
+        return []
+
+    debits['desc_norm'] = debits['description'].str.lower().str.strip().str[:60]
+    debits = debits.sort_values('date')
+
+    for vendor, group in debits.groupby('desc_norm'):
+        if len(group) < 4:
+            continue
+        amounts = group['amount'].abs().values
+        # Régression linéaire sur les montants
+        x = np.arange(len(amounts))
+        if amounts.std() == 0:
+            continue
+        slope, _, r_value, _, _ = scipy_stats.linregress(x, amounts)
+        if slope > amounts.mean() * 0.05 and r_value > 0.7:
+            total_increase = amounts[-1] - amounts[0]
+            pct_increase = total_increase / amounts[0] * 100 if amounts[0] > 0 else 0
+            for _, row in group.iterrows():
+                flags.append(_flag(
+                    row, 73,
+                    "Surfacturation progressive",
+                    f"'{vendor[:40]}' augmente ses montants de ~{slope:.0f}€ par transaction "
+                    f"(+{pct_increase:.0f}% au total, R²={r_value**2:.2f}). "
+                    "Augmentation régulière sans justification = signal de surfacturation.",
+                    "fraude_fournisseur"
+                ))
+    return _dedup(flags)
+
+
+def cas_revenus_anormalement_bas(df):
+    """
+    FRAUDE FISCALE / SKIMMING — Recettes anormalement basses par rapport aux dépenses.
+    Un restaurant qui dépense 10 000€ en fournisseurs mais encaisse seulement 5 000€
+    dissimule probablement une partie de son chiffre d'affaires (espèces non déclarées).
+    """
+    flags = []
+    total_debits = df[df['amount'] < 0]['amount'].abs().sum()
+    total_credits = df[df['amount'] > 0]['amount'].sum()
+
+    if total_debits < 1000 or total_credits <= 0:
+        return []
+
+    ratio = total_credits / total_debits
+    # Pour un commerce normal, les recettes devraient couvrir les dépenses
+    if ratio < 0.6 and total_debits > 5000:
+        # Signaler les crédits (recettes) comme suspectement bas
+        credit_rows = df[df['amount'] > 0]
+        for _, row in credit_rows.iterrows():
+            flags.append(_flag(
+                row, 70,
+                "Recettes anormalement basses vs dépenses",
+                f"Recettes totales ({total_credits:.0f}€) = seulement {ratio*100:.0f}% des dépenses "
+                f"({total_debits:.0f}€). Pour un commerce, ce ratio devrait être ≥ 100%. "
+                "Possible dissimulation de recettes en espèces (skimming fiscal).",
+                "fraude_fiscale"
+            ))
+    return _dedup(flags)
+
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _flag(row, score, titre, detail, categorie):
@@ -470,22 +818,39 @@ def _dedup(flags):
 # ─── Moteur principal ─────────────────────────────────────────────────────────
 
 ALL_RULES = [
+    # Fraudes internes
     cas_doublons,
-    cas_fractionnement,
-    cas_juste_sous_seuil,
-    cas_fournisseur_fantome,
-    cas_montant_rond,
-    cas_pic_depenses,
     cas_virements_personnels,
     cas_remboursements_suspects,
-    cas_transactions_weekend,
-    cas_salaires_irreguliers,
-    cas_outliers_statistiques,
-    cas_retraits_especes,
-    cas_paiements_nuit_weekend,
-    cas_concentration_fournisseur,
+    cas_frais_rembourses_excessifs,
     cas_achats_inhabituels,
+    cas_paiements_inconnus_recurrents,
+    # Fraudes fournisseurs
+    cas_fournisseur_fantome,
+    cas_fournisseur_similaire,
+    cas_concentration_fournisseur,
+    cas_surfacturation_progressive,
+    # Fraudes caisse / liquidités
+    cas_montant_rond,
+    cas_retraits_especes,
+    cas_revenus_anormalement_bas,
+    # Fraudes financières / blanchiment
+    cas_fractionnement,
+    cas_juste_sous_seuil,
+    cas_transactions_circulaires,
+    cas_micro_transactions,
     cas_virements_multiples_meme_jour,
+    cas_loi_benford,
+    # Fraudes paie
+    cas_salaires_irreguliers,
+    cas_inflation_salaires,
+    # Anomalies temporelles / comptables
+    cas_pic_depenses,
+    cas_transactions_weekend,
+    cas_paiements_nuit_weekend,
+    cas_fin_de_periode,
+    # Anomalies statistiques
+    cas_outliers_statistiques,
 ]
 
 
@@ -519,6 +884,7 @@ CATEGORIES_FR = {
     'fraude_caisse': "Fraude caisse / liquidités",
     'fraude_paie': "Fraude sur la paie",
     'fraude_financiere': "Fraude financière / blanchiment",
+    'fraude_fiscale': "Fraude fiscale (dissimulation de recettes)",
     'anomalie_depenses': "Anomalie de dépenses",
     'anomalie_statistique': "Anomalie statistique",
     'anomalie_temporelle': "Anomalie temporelle",

@@ -205,19 +205,39 @@ def extract_with_tables(pdf_path: str) -> list[dict]:
     return all_transactions
 
 
+MAX_FILE_SIZE_MB = 50
+PDF_MAGIC_BYTES = b'%PDF'
+
+
+def _validate_pdf(data: bytes, filename: str = ""):
+    """Vérifie que le fichier est bien un PDF légitime (sécurité)."""
+    if len(data) > MAX_FILE_SIZE_MB * 1024 * 1024:
+        raise ValueError(f"Fichier trop volumineux (max {MAX_FILE_SIZE_MB} Mo).")
+    if len(data) < 4 or data[:4] != PDF_MAGIC_BYTES:
+        raise ValueError("Le fichier ne semble pas être un PDF valide.")
+    # Vérification basique : pas de JavaScript embarqué (vecteur d'attaque courant)
+    if b'/JavaScript' in data[:2000] or b'/JS ' in data[:2000]:
+        raise ValueError("PDF avec JavaScript détecté — refusé pour sécurité.")
+
+
 def extract_pdf(uploaded_file) -> pd.DataFrame:
     """
     Main entry point. Accepts a Streamlit UploadedFile or a file path string.
     Returns a cleaned DataFrame of transactions.
     """
     if isinstance(uploaded_file, str):
+        with open(uploaded_file, 'rb') as f:
+            raw = f.read()
+        _validate_pdf(raw, uploaded_file)
         transactions = extract_with_tables(uploaded_file)
     else:
         # Save to temp buffer for pdfplumber
         import tempfile, os
+        raw = uploaded_file.read()
+        _validate_pdf(raw, getattr(uploaded_file, 'name', ''))
         suffix = '.pdf'
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(uploaded_file.read())
+            tmp.write(raw)
             tmp_path = tmp.name
         try:
             transactions = extract_with_tables(tmp_path)

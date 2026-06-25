@@ -180,7 +180,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("### Modules d'analyse")
-    opt_rules = st.checkbox("Règles métier (16 cas)", value=True)
+    opt_rules = st.checkbox("Règles métier (27 cas)", value=True)
     opt_stats = st.checkbox("Analyse statistique", value=True)
 
     st.markdown("---")
@@ -281,7 +281,7 @@ st.success(f"✅ **{len(df):,} transactions** extraites depuis **{len(all_dfs)} 
 
 
 # ── Analyse ───────────────────────────────────────────────────────────────────
-with st.spinner("Analyse en cours — 16 modules de détection..."):
+with st.spinner("Analyse en cours — 27 modules de détection..."):
     stats_results = run_all_stats(df)
     stats = stats_results.get('stats', {})
     monthly = stats_results.get('monthly', pd.DataFrame())
@@ -509,7 +509,8 @@ with tab2:
                     CATS_FR = {
                         'fraude_interne': 'Fraude interne', 'fraude_fournisseur': 'Fraude fournisseur',
                         'fraude_caisse': 'Fraude caisse', 'fraude_paie': 'Fraude paie',
-                        'fraude_financiere': 'Fraude financière', 'anomalie_depenses': 'Anomalie dépenses',
+                        'fraude_financiere': 'Fraude financière', 'fraude_fiscale': 'Fraude fiscale',
+                        'anomalie_depenses': 'Anomalie dépenses',
                         'anomalie_statistique': 'Anomalie stat.', 'anomalie_temporelle': 'Anomalie temporelle',
                         'risque_fournisseur': 'Risque fournisseur',
                     }
