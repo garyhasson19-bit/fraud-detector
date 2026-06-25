@@ -115,14 +115,52 @@ def parse_date_safe(raw) -> datetime | None:
 
 # ── Détection de colonnes ────────────────────────────────────────────────────
 
-DATE_KW   = ['date', 'jour', 'date op', 'date val', 'date ope', 'date opé', 'date opération']
-DESC_KW   = ['libellé', 'libelle', 'motif', 'opération', 'operation', 'détail',
-             'detail', 'description', 'label', 'nature', 'désignation']
-DEBIT_KW  = ['débit', 'debit', 'sortie', 'retrait', 'dépense', 'depense', 'déb', 'deb']
-CREDIT_KW = ['crédit', 'credit', 'entrée', 'entree', 'versement', 'recette', 'cré', 'cred']
-AMOUNT_KW = ['montant', 'amount', 'valeur']
-# Colonnes à IGNORER (contiennent des soldes cumulatifs, pas des transactions)
-SOLDE_KW  = ['solde', 'balance', 'cumul', 'total', 'running']
+DATE_KW   = [
+    # Français
+    'date', 'jour', 'date op', 'date val', 'date ope', 'date opé', 'date opération',
+    # Néerlandais (Belgique — KBC, BNP Fortis NL, ING NL)
+    'datum', 'datum waarde', 'boekingsdatum', 'waardedag', 'valutadatum', 'transactiedatum',
+]
+DESC_KW   = [
+    # Français
+    'libellé', 'libelle', 'motif', 'opération', 'operation', 'détail', 'detail',
+    'description', 'label', 'nature', 'désignation', 'communication', 'contrepartie',
+    # Néerlandais (Belgique)
+    'omschrijving', 'mededeling', 'tegenpartij', 'referentie', 'betalingsdetails',
+    'verrichtingsomschrijving', 'naam tegenpartij',
+]
+DEBIT_KW  = [
+    # Français
+    'débit', 'debit', 'sortie', 'retrait', 'dépense', 'depense', 'déb', 'deb',
+    # Néerlandais (Belgique)
+    'debet', 'uitstroom', 'afschrijving', 'betaald', 'af',
+]
+CREDIT_KW = [
+    # Français
+    'crédit', 'credit', 'entrée', 'entree', 'versement', 'recette', 'cré', 'cred',
+    # Néerlandais (Belgique)
+    'bijschrijving', 'instroom', 'ontvangen', 'bij',
+]
+AMOUNT_KW = [
+    'montant', 'amount', 'valeur',
+    # Néerlandais — CRITIQUE : "bedrag" est le mot NL pour "montant" (KBC, ING, BNP NL)
+    'bedrag', 'transactiebedrag',
+]
+# Colonnes à IGNORER — soldes cumulatifs, pas des transactions individuelles
+SOLDE_KW  = [
+    'solde', 'balance', 'cumul', 'total', 'running',
+    # Néerlandais
+    'saldo', 'eindsaldo', 'beginsaldo', 'loopend saldo', 'nieuw saldo',
+]
+
+# Lignes à ignorer — lignes de solde initial/final, pas des transactions
+SOLDE_ROW_KW = [
+    'solde initial', 'solde final', 'solde reporté', 'solde report', 'solde précédent',
+    'solde au', 'ancien solde', 'nouveau solde',
+    # Néerlandais
+    'beginsaldo', 'eindsaldo', 'vorig saldo', 'nieuw saldo', 'saldo overgedragen',
+    'overgedragen saldo',
+]
 
 
 def _find_col(header, keywords, exclude=None):
@@ -158,6 +196,15 @@ def _extract_tables(pdf_path: str) -> list[dict]:
                 col_credit = _find_col(header_low, CREDIT_KW, exclude=SOLDE_KW)
                 col_amount = _find_col(header_low, AMOUNT_KW, exclude=SOLDE_KW)
 
+                # KBC / BNP Fortis NL : deux colonnes de date (datum waarde + boekingsdatum)
+                # On prend la première colonne de date trouvée
+                # Si "boekingsdatum" est dans le header, c'est la date comptable (plus fiable)
+                for booking_kw in ['boekingsdatum', 'date comptable', 'date valeur']:
+                    booking_col = _find_col(header_low, [booking_kw])
+                    if booking_col is not None and booking_col != col_date:
+                        col_date = booking_col
+                        break
+
                 # Ignore les colonnes "solde" pour éviter les cumuls
                 solde_cols = {i for i, h in enumerate(header_low) if _is_solde_col(h)}
 
@@ -174,6 +221,11 @@ def _extract_tables(pdf_path: str) -> list[dict]:
                         if i is None or i >= len(data_row) or i in solde_cols:
                             return ''
                         return str(data_row[i] or '').strip()
+
+                    # Ignorer les lignes de solde (initial/final/reporté)
+                    row_text = ' '.join(str(c or '').lower() for c in data_row)
+                    if any(kw in row_text for kw in SOLDE_ROW_KW):
+                        continue
 
                     # Date
                     dt = parse_date_safe(safe(col_date))
